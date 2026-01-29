@@ -8,7 +8,7 @@
 #include <queue.h>
 #include <task.h>
 #include <pico/time.h>
-#include <semphr.h>   // <-- MUTEX
+#include <semphr.h>   
 
 #include "tkjhat/sdk.h"
 
@@ -89,15 +89,6 @@ static const int morse_table_size = sizeof(morse_table) / sizeof(morse_table[0])
     Code includes three safe functions that use I2C-Channel
     safe_write_text, safe_clear_display, read_IMU
 */
-
-/*
-    ---We used AI finding Mutex and understanding how it works---
-    
-    In functions Mutex is Reserving I2C-Channel for Usage. 
-    In this program Mutex Allows only one function to be used in the I2C-Channel, 
-    otherwise the channel would be overcrowded and causing a crash in pico.    
-*/
-
 
 static void safe_write_text(int16_t x0,int16_t y0,const char *txt) {
     // Writes text to Oled display, using mutex to reserve i2c for usage
