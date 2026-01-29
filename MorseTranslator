@@ -1,0 +1,598 @@
+
+#include <stdio.h>
+#include <string.h>
+
+#include <pico/stdlib.h>
+
+#include <FreeRTOS.h>
+#include <queue.h>
+#include <task.h>
+#include <pico/time.h>
+#include <semphr.h>   // <-- MUTEX
+
+#include "tkjhat/sdk.h"
+
+
+// Default Stack_Size for tasks
+#define DEFAULT_STACK_SIZE 2048 
+
+// --- GLOBAL ---
+volatile float ax, ay, az, gx, gy, gz, temperature, button_pressed;
+
+
+// I2C-mutex
+static SemaphoreHandle_t i2c_mtx = NULL;
+
+// Algorithm for morse
+typedef struct {
+    char character;     // E.g. 'A'
+    const char* code;   // E.g. ".-"
+} MorseCode;
+
+// Thresholds for IMU-Sensor
+float g_POS = 200;
+float g_NEG = -200;
+float a_POS = 0.5;
+float a_NEG = -0.5;
+
+// --- States ---
+enum state {NORMAL=1, PRE_DOT, PRE_LINE, PRE_SPACE, RESET};
+volatile enum state programState = NORMAL; 
+
+// --- MORSE BOARD ---
+static const MorseCode morse_table[] = {
+    {'A', ".-"},
+    {'B', "-..."},
+    {'C', "-.-."},
+    {'D', "-.."},
+    {'E', "."},
+    {'F', "..-."},
+    {'G', "--."},
+    {'H', "...."},
+    {'I', ".."},
+    {'J', ".---"},
+    {'K', "-.-"},
+    {'L', ".-.."},
+    {'M', "--"},
+    {'N', "-."},
+    {'O', "---"},
+    {'P', ".--."},
+    {'Q', "--.-"},
+    {'R', ".-."},
+    {'S', "..."},
+    {'T', "-"},
+    {'U', "..-"},
+    {'V', "...-"},
+    {'W', ".--"},
+    {'X', "-..-"},
+    {'Y', "-.--"},
+    {'Z', "--.."},
+    {'1', ".----"},
+    {'2', "..---"},
+    {'3', "...--"},
+    {'4', "....-"},
+    {'5', "....."},
+    {'6', "-...."},
+    {'7', "--..."},
+    {'8', "---.."},
+    {'9', "----."},
+    {'0', "-----"},
+    {' ', "__"}
+};
+
+// Size of Morse Board
+static const int morse_table_size = sizeof(morse_table) / sizeof(morse_table[0]);
+
+// --- I2C-SAFE CALLS USING MUTEX ---
+
+/*
+    Code includes three safe functions that use I2C-Channel
+    safe_write_text, safe_clear_display, read_IMU
+*/
+
+/*
+    ---We used AI finding Mutex and understanding how it works---
+    
+    In functions Mutex is Reserving I2C-Channel for Usage. 
+    In this program Mutex Allows only one function to be used in the I2C-Channel, 
+    otherwise the channel would be overcrowded and causing a crash in pico.    
+*/
+
+
+static void safe_write_text(int16_t x0,int16_t y0,const char *txt) {
+    // Writes text to Oled display, using mutex to reserve i2c for usage
+    
+    if (xSemaphoreTake(i2c_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+        write_text_xy(x0, y0, txt);
+        xSemaphoreGive(i2c_mtx);
+    } else {
+        // Channel reserved too long -> leave frame in between
+    }
+}
+
+static void safe_clear_display() {
+    // Clears oled display, using mutex to reserve i2c for usage
+    
+    if (xSemaphoreTake(i2c_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+        clear_display();
+        xSemaphoreGive(i2c_mtx);
+    } else {
+        
+    }
+}
+
+static void read_IMU() {
+    // Reads positions and movements of imu-sensor, using mutex to reserve i2c for usage.
+    
+    if (xSemaphoreTake(i2c_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ICM42670_read_sensor_data(&ax, &ay, &az, &gx, &gy, &gz, &temperature);
+        xSemaphoreGive(i2c_mtx);
+    } else {
+        // Skip sampling once
+    }
+}
+
+
+// --- MORSE TRANSLATION ---
+static char find_morse_character(const char* morse_code) {
+    /*
+    Compares parameter(morse_code) to morse table. 
+    in case equal Morse line is found , its transalted to character and returned
+    in case no equal Morse line is found, '?' is returned
+    */
+    
+    if (morse_code == NULL || morse_code[0] == '\0') return '?';
+    for (int i = 0; i < morse_table_size; i++) {
+        if (strcmp(morse_table[i].code, morse_code) == 0) {
+            return morse_table[i].character;
+        }
+    }
+    return '?';
+}
+
+// --- BUTTON ---
+static void press_button() {
+    /*
+    Button is using pin GPIO 2
+    Holding down button , Changes Global Constant button_pressed value from 0 -> 1
+    Releasing button , Value goes from 1 -> 0
+    */
+    button_pressed = gpio_get(SW1_PIN);
+}
+
+// --- TASKS ---
+
+/*
+    Code consists four tasks IMU_TASK , STATE_TASK, UI_TASK, SERIAL_TASK.
+    Tasks purpose is to read values given by IMU-Sensors movements.
+    Given values change the state and is translated to morse character.
+    Morse characters are sent via USB port between Computer and Pico.
+    Using pico to create morse is displayed in oled display. 
+    Sending morse from computers Serial monitor to pico is translated to readable text
+    in picos Oled screen. Pico receiving message is alerted using green led and message is played by buzzer. 
+    
+    
+*/
+
+static void IMU_TASK(void *arg){  
+    // Reads values of IMU-sensor and button1
+    
+    (void)arg;
+    
+    for(;;){ 
+        read_IMU();
+        press_button();
+        tight_loop_contents(); 
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void STATE_TASK(void *arg) {
+     /*
+     Changing States According to IMU-Sensors position.
+     Task uses Global borders to check which way pico is tilted.
+     Normal State , when pico is upright and Oled screen is facing towards user.
+     Normal State is also the recommended starting position for user.
+     PRE_DOT, PRE_LINE, are States achieved by Tilting Pico Sideways ( left and right)
+     PRE_SPACE State is achieved by tilting Pico forward
+     RESET State is achieved by holding Right button on the pico
+     
+     Borders are crossed when picos position goes over 80 degrees from Normal State 
+    */
+    (void)arg;
+    
+
+    // Defining resting state (upwards postion)
+    bool device_at_rest;
+    
+    // Setting State as normal to be cautious of stored trash data
+    programState = NORMAL;
+
+    for(;;) {
+        
+        // Pico is upward
+        device_at_rest = (ax < a_POS && ax > a_NEG && az < a_POS && az > a_NEG);
+        
+        // Checking for Users Holding button down and Switching to RESET STATE
+        if (button_pressed == 1) {
+            programState = RESET;
+
+        } else {
+            switch (programState) {
+                // Changing State from Normal to dot, line, space
+                case NORMAL:
+
+                    if (ax < a_NEG) {
+                        // Pico is tilted to left over 80 degrees
+                        programState = PRE_DOT;
+                    } else if (ax > a_POS) {
+                        // Pico is tilted to right over 80 degrees
+                        programState = PRE_LINE; 
+                    } else if (az > a_POS) {
+                        // Pico is tilted to forward over 80 degrees
+                        programState = PRE_SPACE; 
+                    }
+                    break;
+                // Changing State from dot, line, space to Normal  
+                case PRE_DOT:
+
+                case PRE_LINE:
+
+                case PRE_SPACE:
+
+                    if (device_at_rest) {
+                        programState = NORMAL;
+                    }
+                    break;
+                
+                // Changing from Reset state back to normal State
+                case RESET:
+
+                    if (device_at_rest) {
+                        programState = NORMAL;
+                    }
+                    break;
+            }
+        }
+        tight_loop_contents(); 
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void UI_TASK(void *arg) {
+    /*
+        Writing text to oled display according to current state.
+        Pre dot and line States, preview wanted morse character,
+        character is confirmed returning back to normal State.
+        User can translate morse into display by changing state to State_space.
+        ------------------------------------------------------------------------
+        exapmple ( .-_ ) == ( a ).
+        (.-_) will be shown center of the display
+        ( a ) will be shown top of the display
+        -------------------------------------------------------------------------
+        
+        In case user makes an error , display can be cleared by holding right button under the oled displayed (sw1 - GPIO2)
+    */
+    
+    (void)arg;
+    
+
+    enum state prev = -1;
+    
+    // buffer for holding morse characters exmpl('.') , indexbuffer and ending mark '\0' for buffer
+    char morse_BUFFER[10];
+    int morse_INDEX = 0;
+    morse_BUFFER[0] = '\0';
+
+    // Buffer for holding characters exmpl('s') , indexbuffer and ending mark '\0' for buffer
+    char word_BUFFER[50];
+    int word_INDEX = 0;
+    word_BUFFER[0] = '\0';
+
+    safe_write_text(45,27,"Start"); 
+    
+
+
+    for (;;) {
+
+
+        // case of previewing morse characters and translating to characters
+        // clearing screen to avoid overtyping
+        if (programState != prev) {
+            safe_clear_display();
+            
+
+            // displaying wanted character 
+            switch (programState) {
+                // previewing morse character '.' and shown on display
+                case PRE_DOT:
+                    
+                    if (morse_INDEX < (int)(sizeof(morse_BUFFER) - 1)) {
+                        morse_BUFFER[morse_INDEX++] = '.';
+                        morse_BUFFER[morse_INDEX] = '\0';
+                    }
+                    safe_write_text(0,50, "."); 
+                    break;
+
+                case PRE_LINE:
+                // previewing morse character '-' and shown on display
+                    if (morse_INDEX < (int)(sizeof(morse_BUFFER) - 1)) {
+                        morse_BUFFER[morse_INDEX++] = '-';
+                        morse_BUFFER[morse_INDEX] = '\0';
+                    }
+                    safe_write_text(0,50,"-"); 
+                    break;
+
+                case PRE_SPACE:
+                /*
+                    Translating morse characters to character.
+                    clearing morse character list.
+                    in case of empty morse character list, creates morse character '_'  ,
+                    '_' is translated as character ' '
+                */
+                    if (morse_INDEX > 0) {
+                        char letter = find_morse_character(morse_BUFFER); // Renamed 'kirjain' -> 'letter'
+                        if (word_INDEX < (int)(sizeof(word_BUFFER) - 1)) {
+                            word_BUFFER[word_INDEX++] = letter;
+                            word_BUFFER[word_INDEX] = '\0'; 
+                        }
+                        morse_INDEX = 0;
+                        morse_BUFFER[0] = '\0';
+                    } else if (word_INDEX > 0 && word_BUFFER[word_INDEX-1] != ' ') {
+                        if (word_INDEX < (int)(sizeof(word_BUFFER) - 1)) {
+                            word_BUFFER[word_INDEX++] = ' ';
+                            word_BUFFER[word_INDEX] = '\0';
+                        }
+                    }
+                    safe_write_text(0,50,"_"); 
+                    break;
+
+                case RESET:
+                // clears both Buffers and display
+                    morse_INDEX = 0;
+                    morse_BUFFER[0] = '\0';
+                    word_INDEX = 0;
+                    word_BUFFER[0] = '\0';
+
+                    safe_clear_display();
+                    safe_write_text(45,27,"RESET");
+                    break;
+
+                case NORMAL:
+                // displays both buffers
+                default:
+                    safe_write_text(0,40,morse_BUFFER);
+                    safe_write_text(0,10,word_BUFFER);
+                    break;
+            }
+            prev = programState;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void SERIAL_TASK(void *arg) {
+    /*
+        used for sending a message from computers Serial monitor to pico using scanf.
+        pico receiving message will be alerted by green led and buzzer playing the received morse message,
+        Message is translated in pico and shown as text on display.
+        ---------------------------------------------------------------------------------------------------
+        message is written using morse characters and message must end to character '_'
+        example in serial monitor ( .-__-..._-.-._ ) is show in pico display ( A BC ) 
+        in case of wrong out of bound characters are show as '?'
+        ---------------------------------------------------------------------------------------------------
+    */
+    
+    (void)arg;
+    // buffer for writing morse characters exmpl('.-_') , indexbuffer and ending mark '\0' for buffer
+    char serial_BUFFER[100];
+    int serial_INDEX = 0;
+    serial_BUFFER[0] = '\0';
+
+    // buffer for holding morse characters to be translated to characters exmpl('.-_') -> ('A')
+    // indexbuffer and ending mark '\0' for buffer
+    char msg_BUFFER[30];
+    int msg_INDEX = '\0';
+ 
+    // buffer for holding characters exmpl('ABC') , indexbuffer and ending mark '\0' for buffer
+    char wrd_BUFFER[50];
+    int wrd_INDEX = '\0';
+
+    for(;;) {
+        
+        // writing message using serial monitor
+        int received_message = scanf("%99s",serial_BUFFER);
+        
+        // playing the received message using buzzer
+        // turning green led on during the message
+        if(received_message > 0) {
+            // turning led ON
+            init_rgb_led();
+            
+            for(int i = 0;serial_BUFFER[i] != '\0' && i < 99;i++) {
+                
+                rgb_led_write(0, 255,0);
+                sleep_ms(100);
+                if(serial_BUFFER[i] == '.') {
+                    buzzer_play_tone(800,200);
+                } else if(serial_BUFFER[i] == '-'){
+                    buzzer_play_tone(800,400);  
+                } else if(serial_BUFFER[i] == '_'){
+                    sleep_ms(300);
+                }
+                
+            }
+            // turning led off
+            stop_rgb_led();
+            
+            // resetting wrd_buffer for new message
+            wrd_BUFFER[0] = '\0';
+            wrd_INDEX = 0;
+            
+
+            // looping trough written message sent to pico
+            for(int i = 0; serial_BUFFER[i] != '\0' && i < 99;i++) {
+                // Adding morse character to msg buffer incase of dot or line
+                if(serial_BUFFER[i]=='.' || serial_BUFFER[i]=='-') {
+                   if(msg_INDEX < 29) {
+                    msg_BUFFER[msg_INDEX] = serial_BUFFER[i];
+                    msg_INDEX++;
+                    msg_BUFFER[msg_INDEX] = '\0';
+                   }
+                // encountering double space in message adds character space   
+                } else if(serial_BUFFER[i]=='_' &&  serial_BUFFER[i+1]=='_') {
+                    char result = find_morse_character(msg_BUFFER);
+                    msg_BUFFER[0] = '\0';
+                    msg_INDEX = 0;
+
+                    wrd_BUFFER[wrd_INDEX] = result;
+                    wrd_INDEX++;
+                    wrd_BUFFER[wrd_INDEX] = ' ';
+                    wrd_INDEX++;
+                    wrd_BUFFER[wrd_INDEX] = '\0';
+
+
+                // going trough double space
+                } else if(serial_BUFFER[i]=='_' &&  serial_BUFFER[i-1]=='_') {
+                    
+                    
+                    continue;
+                    
+                // encountering one space in message 
+                // translates written morse character to character 
+                } else if(serial_BUFFER[i]=='_') {
+                    char result = find_morse_character(msg_BUFFER);
+                    msg_BUFFER[0] = '\0';
+                    msg_INDEX = 0;
+
+                    wrd_BUFFER[wrd_INDEX] = result;
+                    wrd_INDEX++;
+                    wrd_BUFFER[wrd_INDEX] = '\0';
+                    
+                }
+
+                
+            }
+
+
+            
+            // echoing sent morse text and translated text
+            printf("Received message: %s and word %s\n",serial_BUFFER,wrd_BUFFER);
+            
+            safe_clear_display();
+            // Message is displayed in oled screen
+            safe_write_text(45,27,wrd_BUFFER);
+            // sleep_ms(2000);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            safe_clear_display();
+            
+            serial_BUFFER[0] = '\0';
+            
+        } else {
+            // incase of an error
+            printf("Message failed!");
+        }
+        
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+
+
+    }
+
+
+}
+
+// --- MAIN ---
+int main() {
+    
+    // ---initializing--- 
+    
+    stdio_init_all();
+    
+    // intializing hat_sdk
+    init_hat_sdk();
+    
+    // breaks for clearing trash data
+    sleep_ms(300); 
+    
+    // initializing display
+    init_display();
+    
+    // initializing Imu-sensor for I2C-Channel
+    init_ICM42670();
+    ICM42670_start_with_default_values();
+    
+    // initializing button
+    init_button1();
+    
+    // initializing buzzer
+    init_buzzer();
+    
+    // breaks for clearing trash data
+    sleep_ms(300);
+    
+
+    // Creating mutex
+    i2c_mtx = xSemaphoreCreateMutex();
+    // incase of an error
+    if(i2c_mtx == NULL) {
+        printf("Mutex creation failed \n");
+        while(1);
+    }
+    
+    // ---- Task Creation -----
+    TaskHandle_t myIMU_TASK, mySTATE_TASK, myUI_TASK,mySERIAL_TASK = NULL;
+
+    BaseType_t result = xTaskCreate(IMU_TASK,       // (en) Task function
+                "IMU_TASK",              // (en) Name of the task 
+                DEFAULT_STACK_SIZE, // (en) Size of the stack for this task (in words). Generally 1024 or 2048
+                NULL,               // (en) Arguments of the task 
+                2,                  // (en) Priority of this task
+                &myIMU_TASK);    // (en) A handle to control the execution of this task
+
+    if(result != pdPASS) {
+        printf("IMU_TASK creation failed\n");
+        return 0;
+    }
+
+    result = xTaskCreate(STATE_TASK,       // (en) Task function
+                "STATE_TASK",              // (en) Name of the task 
+                DEFAULT_STACK_SIZE, // (en) Size of the stack for this task (in words). Generally 1024 or 2048
+                NULL,               // (en) Arguments of the task 
+                2,                  // (en) Priority of this task
+                &mySTATE_TASK);    // (en) A handle to control the execution of this task
+
+    if(result != pdPASS) {
+        printf("STATE_TASK creation failed\n");
+        return 0;
+    }
+
+      result = xTaskCreate(UI_TASK,       // (en) Task function
+                "UI_TASK",              // (en) Name of the task 
+                DEFAULT_STACK_SIZE, // (en) Size of the stack for this task (in words). Generally 1024 or 2048
+                NULL,               // (en) Arguments of the task 
+                2,                  // (en) Priority of this task
+                &myUI_TASK);    // (en) A handle to control the execution of this task
+
+    if(result != pdPASS) {
+        printf("UI_TASK creation failed\n");
+        return 0;
+    }
+
+          result = xTaskCreate(SERIAL_TASK,       // (en) Task function
+                "SERIAL_TASK",              // (en) Name of the task 
+                DEFAULT_STACK_SIZE, // (en) Size of the stack for this task (in words). Generally 1024 or 2048
+                NULL,               // (en) Arguments of the task 
+                2,                  // (en) Priority of this task
+                &mySERIAL_TASK);    // (en) A handle to control the execution of this task
+
+    if(result != pdPASS) {
+        printf("SERIAL_TASK creation failed\n");
+        return 0;
+    }
+    
+    // --- Starting program ---
+    vTaskStartScheduler();
+    return 0;
+}
